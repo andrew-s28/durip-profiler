@@ -1,5 +1,9 @@
 /*
-  DURIP profiler operation by Andrew Scherer and Jon Fram.
+  rapid profiling system (RPS) operation by Andrew Scherer and Jon Fram.
+  2023-09-26 edits from jfram begin. Mostly max/min factor related. The other 90%+ of the code is from Andrew in summer 2023.
+  Features designed based on Andrew and jfram's discussions, minimal code by jfram from spring 2023, and feedback from Rocky Geyer via jfram. 
+  Jim Lerczak, principal investigator
+  funded by the Office of Naval Research DURIP program
 */
 
 #include <RTClib.h>
@@ -14,13 +18,15 @@ File data_file;                                                         //
                                                                         //
 const long CPCM = 244;                                                  // counts/cm (empirically measured from 100 ft of line payout)
 const long SLOW_DEPTH = 2;                                              // slowing down for final 2 meters on move down
-int water_depth = 25;                                                   // water depth in meters
-int depth_factor = 3*10;                                                // factor to multiply by water depth to get actual line payout, multiplied by 10 to allow for one decimal place
+int water_depth = 25;                                                   // water depth in meters. This and other parameters are loaded from EPROM, not here.
+int depth_factor = 1*10;                                                // factor to multiply by water depth to get actual line payout, multiplied by 10 to allow for one decimal place
+int min_depth_factor = 1.0*10;                                          // factor to multiply by water depth to get actual line payout at slack tide, multiplied by 10 to allow for one decimal place
+int max_depth_factor = 1.3*10;                                          // factor to multiply by water depth to get actual line payout at max tide, multiplied by 10 to allow for one decimal place
 long accel = CPCM*100/10;                                               // 1 m/s^2 accel/decel rate
 long up_vel = CPCM*100*10;                                              // 1 m/s upwards velocity
-long min_sur_vel = CPCM*10*10;                                          //
-long max_sur_vel = CPCM*30*10;                                          //
-long sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0;                 // 0.25 m/s surface velocity
+long min_sur_vel = CPCM*100*10;                                         //
+long max_sur_vel = CPCM*100*10;                                         //
+long sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0;                 // m/s surface velocity
 long down_vel = CPCM*25*10;                                             // 0.25 m/s initial down velocity
 long bot_vel = CPCM*5*10;                                               // 0.05 m/s final down velocity
 long cur_pos = 0;                                                       // stores position when winch turns off
@@ -34,8 +40,8 @@ long move_status;                                                       //
 bool last_move_success = true;                                          //
                                                                         //
 long sur_wait = 10;                                                     // surface wait time (seconds)
-long bot_wait = 10;                                                     // bottom wait time, time b/t profiles (seconds)
-long first_wait = 10;                                                   // time before first profile (seconds)
+long bot_wait = 60;                                                     // bottom wait time, time b/t profiles (seconds)
+long first_wait = 20;                                                   // time before first profile (seconds)
                                                                         //
 RTC_DS3231 rtc;                                                         // real time clock board type
                                                                         //
@@ -70,7 +76,7 @@ void commandWinch(char *cmd, File &data_file) {
         Serial.print(F("Sent: "));  Serial.print(cmd);
         data_file.print(F("Sent: ")); data_file.print(cmd);
     }
-    delay(500);
+    delay(500); // milliseconds
     // receive and save response to char array res
     int idx = 0;
     while (Serial2.available() > 0) {
@@ -178,7 +184,6 @@ void moveUp (File &data_file) {
     eventStatusRegister(data_file);                                     //        
     getPosition(data_file);                                             // get final position of move, save to cur_pos
     setBotPos();                                                        // always return to original position of 0
-
 }
 
 void moveDown (File &data_file) {
@@ -276,6 +281,12 @@ void getVar(char *c, bool all=false) {
         Serial.println((double)depth_factor/10.0);
         Serial.print(F("Total line payout (m): "));
         Serial.println(water_depth*(double)depth_factor/10.0);
+    } else if (strcmp(c, "maxfactor") == 0) {
+        Serial.print(F("Max depth factor: "));
+        Serial.println((double)max_depth_factor/10.0);
+    } else if (strcmp(c, "minfactor") == 0) {
+        Serial.print(F("Min depth factor: "));
+        Serial.println((double)min_depth_factor/10.0);
     } else if (strcmp(c, "bottvel") == 0) {
         Serial.print(F("Bottom velocity (cm/s): "));
         Serial.println(bot_vel/(CPCM*10L));
@@ -305,6 +316,8 @@ void getVar(char *c, bool all=false) {
         getVar("bottvel");
         getVar("depth", true);
         getVar("factor", true);
+        getVar("minfactor", true);
+        getVar("maxfactor", true);
         getVar("surfwait");
         getVar("bottwait");
         getVar("firstwait");
@@ -352,9 +365,15 @@ void setVar(char *c, long val) {
             getVar("depth", true);
             getVar("factor", true);
         }
+    } else if (strcmp(c, "maxfactor") == 0) {
+        max_depth_factor = val;
+        getVar("maxfactor");
+    } else if (strcmp(c, "minfactor") == 0) {
+        min_depth_factor = val;
+        getVar("minfactor");
     } else if (strcmp(c, "minsurfvel") == 0) {
         if (val*CPCM*10 > max_sur_vel) {
-            Serial.println(F("Minimum surface velocity must be less than minimum surface velocity. No action taken."));
+            Serial.println(F("Minimum surface velocity must be less than maximum surface velocity. No action taken."));
             getVar("maxsurfvel", true);
         } else if (val*CPCM*10 <= max_sur_vel) {
             min_sur_vel = val*CPCM*10L;
@@ -390,7 +409,9 @@ void help() {
     Serial.println(F("'downvel': The max velocity of the profiler on its downwards return in cm/s."));
     Serial.println(F("'bottvel: The velocity of the profiler on the final two meters of the descent in cm/s."));
     Serial.println(F("'depth': The water depth in meters."));
-    Serial.println(F("'factor': The water depth is multiplied by this factor and, after reaching the surface, this is how much line is paid out. Must be greater than or equal to one."));
+    Serial.println(F("'factor': The water depth is multiplied by this factor. This is how much line is paid out. Must be greater than or equal to one."));
+    Serial.println(F("'minfactor': The water depth is multiplied by this factor. This is how much line is paid out at slack tide. Must be greater than or equal to one."));
+    Serial.println(F("'maxfactor': The water depth is multiplied by this factor. This is how much line is paid out at max tide. Must be greater than or equal to one."));
     Serial.println(F("'surfwait': The wait time at the surface in minutes."));
     Serial.println(F("'bottwait': The wait time at the bottom in minutes. AKA, the time between profiles."));
     Serial.println(F("'firstwait': The wait time before beginning the first profile, after this setup is finished, in minutes."));
@@ -416,8 +437,11 @@ void exit() {
     getVar("all");
     if (!sd_works) {
         sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
+        depth_factor = (int)(max_depth_factor + min_depth_factor)/2.0;
         Serial.print(F("Since SD card failed, or not present, using default surface velocity (cm/s): "));
-        Serial.println(sur_vel/(CPCM*10));        
+        Serial.println(sur_vel/(CPCM*10));
+        Serial.print(F("Since SD card failed, or not present, using default depth factor: "));
+        Serial.println((double)depth_factor/10);        
     }
     Serial.println(F("Variables are saved and will remain until changed."));
     Serial.println(F("Happy profiling! :)"));
@@ -458,7 +482,7 @@ void readSerialCommand () {
     } else if (strcmp(strtokIdx, "s") == 0) {
         // strtol sets val to 0 if not able to convert to long
         strtokIdx = strtok(NULL, " ");
-        if (strcmp(strtokIdx, "factor") == 0) {
+        if (strcmp(strtokIdx, "factor") == 0  || strcmp(strtokIdx, "maxfactor") == 0 || strcmp(strtokIdx, "minfactor") == 0) {
             // factor is a float so deal with that (only stores first decimal place)
             double temp_val = strtod(strtok(NULL, " "), NULL);
             val = round(temp_val*10);
@@ -494,6 +518,8 @@ void saveVars() {
     EEPROM.put(RW_ADDRESS + 28, bot_vel);
     EEPROM.put(RW_ADDRESS + 32, min_sur_vel);
     EEPROM.put(RW_ADDRESS + 36, max_sur_vel);
+    EEPROM.put(RW_ADDRESS + 40, min_depth_factor);
+    EEPROM.put(RW_ADDRESS + 44, max_depth_factor);
     sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
 }
 
@@ -513,8 +539,9 @@ void readVars() {
     EEPROM.get(RW_ADDRESS + 28, bot_vel);
     EEPROM.get(RW_ADDRESS + 32, min_sur_vel);
     EEPROM.get(RW_ADDRESS + 36, max_sur_vel);
+    EEPROM.get(RW_ADDRESS + 40, min_depth_factor);
+    EEPROM.get(RW_ADDRESS + 44, max_depth_factor);
     sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
-
 }
 
 int findClosestTideTime (long now_time, File &tide_file) {
@@ -585,24 +612,34 @@ void getTidalState (File &tide_file) {
     if (tide_success == -1) {
         use_tides = false;
         sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
+        depth_factor = (int)(max_depth_factor + min_depth_factor)/2.0; // FRAM
     // all times are before now (also catches return 0 in case if statement in findClosest doesn't trigger)
     } else if (tide_success == -2 || tide_success == 0) {
         use_tides = false;
         sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
+        depth_factor = (int)(max_depth_factor + min_depth_factor)/2.0; // FRAM
     // incorrect tide file format
     } else if (tide_success == -3) {
         use_tides = false;
         sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
+        depth_factor = (int)(max_depth_factor + min_depth_factor)/2.0; // FRAM
     // success - compute tidal state based on linear regression between high and low tide times, using abs value function
     } else if (tide_success > 0) {
         double slope = -2.0*(double)(max_sur_vel - min_sur_vel)/(upper_tide_time - lower_tide_time);
         double peak_flow = (upper_tide_time + lower_tide_time)/2.0;
         sur_vel = slope*fabs(seconds - peak_flow) + (double)max_sur_vel;
+        slope = -2.0*(double)(max_depth_factor - min_depth_factor)/(upper_tide_time - lower_tide_time); // FRAM
+        depth_factor = (int)(slope*fabs(seconds - peak_flow)) + max_depth_factor;  // FRAM
     // catch any other unknown states
     } else {
         use_tides = false;
         sur_vel = (double)(max_sur_vel + min_sur_vel)/2.0; 
+        depth_factor = (int)(max_depth_factor + min_depth_factor)/2.0; // FRAM
     }
+    inter_bot_pos = -water_depth*(depth_factor/10.0)*100*CPCM+200*CPCM; // FRAM
+    bot_pos = -water_depth*(depth_factor/10.0)*100*CPCM; // FRAM
+    inter_sur_pos = water_depth*100*CPCM;// FRAM
+    sur_pos = water_depth*(depth_factor/10.0)*100*CPCM; // FRAM
 }
 
 void printTidalState(File &data_file) {
@@ -638,6 +675,10 @@ void printTidalState(File &data_file) {
         data_file.print(F("Unknown tide table error. Using default surface velocity."));
         data_file.println(sur_vel/(double)(CPCM*10));
     }
+    Serial.print(F("Depth factor: "));
+    Serial.println((double)depth_factor/10.0);
+    data_file.print(F("Depth factor: "));
+    data_file.println((double)depth_factor/10.0);
 }
 
 void setup () {
@@ -647,7 +688,6 @@ void setup () {
     // winch on during setup to ensure it is working
     digitalWrite(PIN_BRAKE, LOW);
     digitalWrite(PIN_MOTOR, LOW);
-
 
     // initialize serial ports 
     Serial.begin(9600);     // for serial with computer
@@ -740,8 +780,8 @@ void loop () {
         if (tide_file) {
             getTidalState(tide_file);
             tide_file.close();
-        } else if (!tide_file) {
-
+        } else if (!tide_file) {  
+            Serial.print(F("Error opening: ")); Serial.println(tide_file);
         }
 
     }
@@ -769,7 +809,6 @@ void loop () {
         // print tidal success and surface velocity 
         printTidalState(data_file);
     }
-
 
     // get voltage supplied to arduino board
     data_file.print(F("Arduino board voltage (V): "));
@@ -827,6 +866,5 @@ void loop () {
     use_tides = true; 
     
     // bottom delay between profiles
-    delay(bot_wait*1000);
-    
+    delay(bot_wait*1000);    
 }
